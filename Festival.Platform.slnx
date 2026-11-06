@@ -1,0 +1,5 @@
+<Solution>
+  <Project Path="src/Festival.Api/Festival.Api.csproj" />
+  <Project Path="src/Modules/Notifications/Festival.Modules.Notifications.csproj" />
+  <Project Path="src/Modules/Registration/Festival.Modules.Registration.csproj" />
+</Solution>
