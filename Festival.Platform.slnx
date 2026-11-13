@@ -2,4 +2,8 @@
   <Project Path="src/Festival.Api/Festival.Api.csproj" />
   <Project Path="src/Modules/Notifications/Festival.Modules.Notifications.csproj" />
   <Project Path="src/Modules/Registration/Festival.Modules.Registration.csproj" />
+  <Folder Name="/tests/">
+    <Project Path="tests/Festival.Modules.Registration.Tests/Festival.Modules.Registration.Tests.csproj" />
+    <Project Path="tests/Festival.Modules.Registration.IntegrationTests/Festival.Modules.Registration.IntegrationTests.csproj" />
+  </Folder>
 </Solution>
