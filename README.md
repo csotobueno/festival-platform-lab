@@ -31,9 +31,10 @@ Stage 1 — Modular Monolith Foundation
 
 Issue #4 implements the Registration portion of the first vertical slice:
 validate attendee details, create a confirmed registration, persist it in
-PostgreSQL, and reject duplicate emails. Notifications remains an independent
-placeholder. The domain and architecture documents describe the broader planned
-flow; notification integration is deliberately deferred by this issue.
+PostgreSQL, and reject duplicate emails. Issue #5 adds an independently testable
+Notifications request and delivery lifecycle with PostgreSQL persistence and
+simulated delivery. The domain and architecture documents describe the broader
+planned flow; Registration → Notifications integration remains deferred.
 
 ## Solution structure
 
@@ -53,17 +54,21 @@ src/
     │   └── RegistrationModuleExtensions.cs
     └── Notifications/
         ├── Festival.Modules.Notifications.csproj
+        ├── Domain/
+        ├── Application/
+        ├── Infrastructure/          # DbContext, simulated delivery, migrations
         └── NotificationsModuleExtensions.cs
 ```
 
 `Festival.Api` is the composition root. It references both modules and calls
-`AddRegistrationModule(connectionString)` and `AddNotificationsModule()` to
+`AddRegistrationModule(connectionString)` and `AddNotificationsModule(connectionString)` to
 configure dependency injection. The host also calls `MapRegistrationEndpoints()`
 and configures generic problem responses for unhandled exceptions.
 
 Neither module references the other. Registration uses the ASP.NET Core framework
 for its module-owned endpoints and EF Core with the Npgsql PostgreSQL provider for
-persistence. Notifications retains only its DI abstraction dependency.
+persistence. Notifications uses the same EF Core/Npgsql package versions for its
+own persistence, without an ASP.NET Core dependency or public HTTP endpoint.
 
 ## Registration design
 
@@ -101,6 +106,46 @@ Unit of Work. Layering inside that project is maintained by code organization;
 it is not enforced by separate assemblies. There is no independent Attendee
 entity, notifications integration, or automatic migration on API startup.
 
+## Notifications design
+
+- The internal `Notification` aggregate has a generated `NotificationId`, a
+  required nonempty `RegistrationId`, recipient email, UTC `RequestedAt`, and
+  initial `Pending` status. Recipient email is trimmed and validated using the
+  same basic address checks as Registration; case is preserved because Notifications
+  does not use it as a uniqueness key. No Registration record lookup is performed.
+- Only `MarkAsSent()` and `MarkAsFailed()` change status. Both require `Pending`;
+  `Sent` and `Failed` are terminal, including after loading from persistence.
+  There is no transition back to `Pending` and no public state setters.
+- `RequestNotificationUseCase` depends on Application-owned
+  `INotificationRepository` and `INotificationDelivery`. The aggregate, use case,
+  application contracts, and persistence services are internal, accessible only
+  to this module and its two friend test assemblies. There is no inter-module
+  contract yet.
+- The repository's `AddAsync` commits `Pending` and retains the tracked aggregate.
+  Delivery then runs with no database transaction open. A separate
+  `SaveChangesAsync` commits the terminal status before the use case returns
+  `Success(notificationId)` or `DeliveryFailed(notificationId)`. Domain validation
+  errors return `InvalidInput(error)` without storage or delivery activity.
+- `INotificationDelivery` returns an explicit `Sent` or `Failed` outcome for
+  expected provider outcomes, including known rejections/timeouts. The default
+  simulated adapter always reports success and sends no email or network request.
+  Tests substitute controlled outcomes; there is no failure configuration switch.
+- Unexpected adapter errors, cancellation, and all persistence failures propagate.
+  There is no broad catch that marks these failures as delivery failures. Initial
+  save failure prevents delivery. If delivery throws or the final save fails,
+  the previously committed row remains `Pending`; the scope must be disposed
+  after an exception rather than reused to retry tracked changes.
+- `NotificationDbContext` owns `notifications.notifications` with primary key
+  `notification_id`, scalar `registration_id` (no foreign key), `recipient_email`,
+  text `status`, and `requested_at` (`timestamptz`). Migration history is in the
+  `notifications` schema. The use case, repository, adapter, and context are scoped.
+
+Two commits deliberately leave a reliability gap: a crash or final-save failure
+after delivery may leave `Pending` even though delivery occurred. There is no
+automatic recovery, retry, idempotency guarantee, or cross-module transaction in
+this issue. `Sent` represents simulated delivery success only. Separate schemas
+allow both modules to share a physical database without sharing tables or migrations.
+
 ## Build
 
 Install the .NET 10 SDK, then run from the repository root:
@@ -119,13 +164,15 @@ in your terminal (the environment variable also configures the EF design factory
 
 ```sh
 export ConnectionStrings__Registration='Host=localhost;Port=5432;Database=festival;Username=<user>;Password=<password>'
+export ConnectionStrings__Notifications="$ConnectionStrings__Registration"
 dotnet ef database update --project src/Modules/Registration
+dotnet ef database update --project src/Modules/Notifications
 ```
 
-The initial migration creates the module-owned schema, table, and unique index.
+The migrations create each module's schema and table, plus Registration's unique index.
 Apply migrations explicitly before starting the API; the database user needs the
 corresponding DDL permissions (and permission to create the database if absent).
-Missing connection-string configuration fails fast at startup.
+Both connection strings are required; missing configuration fails fast at startup.
 
 Start the API with an explicit local URL:
 
@@ -202,6 +249,7 @@ To run only unit tests without Docker:
 
 ```sh
 dotnet test tests/Festival.Modules.Registration.Tests
+dotnet test tests/Festival.Modules.Notifications.Tests
 ```
 
 Unit tests cover domain validation, value equality, normalization, identity,
@@ -209,6 +257,15 @@ confirmed status, UTC timestamp, use-case results, cancellation, and propagation
 of unexpected errors. Integration tests exercise the real API host and PostgreSQL
 for `201`/`400`/`409`/`500`, persisted data, migration/model consistency, unrelated
 database errors, and preservation of `/health`.
+
+Notifications unit tests cover creation, email validation, terminal transitions,
+controlled delivery outcomes, operation ordering, cancellation, and exception
+propagation. Its PostgreSQL integration tests load `Pending` from a separate
+connection during delivery, verify both terminal outcomes in fresh contexts,
+update reloaded aggregates, verify DI registration and migration consistency,
+and inject real PostgreSQL constraint failures on insert/update. Failed final
+saves propagate and preserve the committed `Pending` row. Each Notifications
+test uses its own database and the same Testcontainers setup as Registration.
 
 The concurrency test synchronizes two real repository lookups so both observe
 an absent email before either inserts. Separate HTTP scopes/DbContexts then race
@@ -223,6 +280,7 @@ Check migrations against the model after future changes:
 
 ```sh
 dotnet ef migrations has-pending-model-changes --project src/Modules/Registration
+dotnet ef migrations has-pending-model-changes --project src/Modules/Notifications
 ```
 
 Inspect project references:
