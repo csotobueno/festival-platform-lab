@@ -196,6 +196,7 @@ public sealed class RegistrationApiTests(PostgreSqlFixture postgres) : IClassFix
         {
             builder.UseEnvironment("Development");
             builder.UseSetting("ConnectionStrings:Registration", connectionString);
+            builder.UseSetting("ConnectionStrings:Notifications", connectionString);
             if (configure is not null) builder.ConfigureTestServices(configure);
         });
         return factory.CreateClient();

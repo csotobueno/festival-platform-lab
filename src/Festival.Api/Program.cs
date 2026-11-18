@@ -7,7 +7,9 @@ var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddRegistrationModule(
     builder.Configuration.GetConnectionString("Registration")
     ?? throw new InvalidOperationException("ConnectionStrings:Registration must be configured."));
-builder.Services.AddNotificationsModule();
+builder.Services.AddNotificationsModule(
+    builder.Configuration.GetConnectionString("Notifications")
+    ?? throw new InvalidOperationException("ConnectionStrings:Notifications must be configured."));
 builder.Services.AddProblemDetails();
 
 var app = builder.Build();
