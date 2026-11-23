@@ -198,6 +198,29 @@ dotnet build
 dotnet tool restore
 ```
 
+## Continuous Integration
+
+The [CI workflow](.github/workflows/ci.yml) runs on pull requests targeting `main`
+and pushes to `main`. A single `build-and-test` job on `ubuntu-latest` installs
+the .NET 10 SDK, restores dependencies, builds the complete solution in Release,
+and runs all unit and PostgreSQL integration tests without rebuilding.
+Any restore, build, test, or PostgreSQL container startup failure fails the job.
+
+Testcontainers uses the runner's Docker environment to create and dispose of its
+own PostgreSQL containers. No separate database service, configured connection
+string, or database secrets are needed; resource cleanup remains enabled.
+Inspect results and step logs in the repository's **Actions** tab under **CI**,
+or open the CI check on a pull request.
+
+For equivalent local validation, install the .NET 10 SDK, start Docker, and run
+from the repository root:
+
+```sh
+dotnet restore Festival.Platform.slnx
+dotnet build Festival.Platform.slnx --configuration Release --no-restore
+dotnet test Festival.Platform.slnx --configuration Release --no-build
+```
+
 ## Run
 
 Use a local PostgreSQL instance and supply its connection string through host
