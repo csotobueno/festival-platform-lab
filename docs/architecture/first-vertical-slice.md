@@ -2,7 +2,7 @@
 
 **Project:** Festival Platform Lab  
 **Stage:** 1 — Modular Monolith Foundation  
-**Status:** Proposed design for implementation; notification-status ownership refinement awaits review
+**Status:** Implemented through Issue #6; Notifications owns its delivery status
 
 ## 1. Purpose
 
@@ -60,9 +60,24 @@ A duplicate or invalid submission is rejected with a meaningful error. It is not
 - The Registration API does not expose Notifications persistence details.
 - Notifications does not change Registration's confirmation state.
 
-**Proposed refinement for review:** The initial discussion suggested a `UpdateNotificationStatus` contract on Registration, invoked by Notifications. Prefer Notifications owning its delivery state instead, because otherwise notification state is duplicated or split across modules. If a later use case requires it, Registration or a query endpoint may obtain delivery status through an explicit Notifications read contract.
+**Implemented ownership:** Notifications owns its delivery state; no `UpdateNotificationStatus` callback or duplicated delivery state exists in Registration. If a later use case requires it, Registration or a query endpoint may obtain delivery status through an explicit Notifications read contract.
 
-Concrete interface signatures and project structure are deferred until the implementation issue; contracts will be defined from actual use-case needs.
+Issue #6 defines `INotificationRequestService.RequestAsync(NotificationRequest,
+CancellationToken)` in `Festival.Modules.Notifications.Contracts`, a dependency-free
+provider-owned library. The request carries only `RegistrationId` and `RecipientEmail`.
+The result is `Success`, `DeliveryFailed`, or `InvalidInput`; no internal entity or
+infrastructure details are returned. An internal scoped Notifications adapter calls
+the existing use case. Both implementations reference the contracts library and
+never reference each other. The API host composes their public DI extensions.
+
+Registration calls the contract only after its repository commits. Expected
+unsuccessful outcomes are logged. Unexpected notification errors (including
+cancellation after commit) are caught at that call boundary and logged with the
+exception, registration identifier, operation and failure category (event `6001`).
+No attendee email/name is added to integration log fields. Registration validation
+and persistence exceptions continue to propagate. Logging failures cannot invalidate
+the committed business result. The API returns HTTP `201` with only `registrationId`,
+regardless of notification outcome; no public Notifications endpoint is added.
 
 ## 6. Persistence and consistency
 
@@ -83,7 +98,12 @@ Concrete interface signatures and project structure are deferred until the imple
 | Delivery provider fails | `Confirmed` | Failure recorded as `Failed` when the request was persisted |
 | Crash between registration commit and notification request | `Confirmed` may exist | Request may be missing; explicitly accepted risk for Stage 1 |
 
-The API must not claim email delivery when it has only accepted or queued a request. The precise response shape and whether a failed send is surfaced as a warning will be chosen during implementation.
+The API returns the Registration identifier only and makes no email delivery claim.
+Failed notification attempts are observed through Notifications-owned state and
+structured logs, without a warning or delivery status in the HTTP response. An
+initial notification persistence failure can leave no durable request; a final
+save failure may leave `Pending` even after delivery. Neither implies automatic
+recovery or guaranteed retry.
 
 ## 7. Minimal architectural structure
 
@@ -131,13 +151,13 @@ Payments and Accreditation remain optional future modules/experiments rather tha
 - Documentation and the resulting PR explain the boundaries and trade-offs.
 - GitHub Actions CI will build and run tests once executable projects are created.
 
-## 11. Open questions for implementation
+## 11. Implementation decisions and remaining questions
 
-1. Exact email normalization and case handling.
-2. Exact validation rules and API error/response shape.
-3. Whether notification delivery is simulated or performed through an external email provider in Stage 1.
-4. Whether delivery should be attempted synchronously after persistence or separated from request acceptance; both must preserve registration correctness.
-5. Whether notification failure is returned as a warning, or only surfaced through Notifications' own status.
-6. Whether the business ultimately needs audit records for rejected attempts.
+Issues #4–#6 implement trimmed, lowercased Registration emails, basic .NET address
+validation, HTTP `201`/`400`/`409` with generic `500` responses, simulated synchronous
+delivery after persistence, and notification failures isolated from the Registration
+response. README documents the concrete rules and test commands.
 
-These questions do not block accepting the first vertical-slice hypothesis; resolve them just in time when implementing the affected behavior.
+Whether the business ultimately needs audit records for rejected attempts remains
+open and outside this slice. Guaranteed notification processing remains a future
+reliability experiment, not a Stage 1 promise.
