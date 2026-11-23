@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install .NET 10 SDK
+        uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Restore dependencies
+        run: dotnet restore Festival.Platform.slnx
+
+      - name: Build solution
+        run: dotnet build Festival.Platform.slnx --configuration Release --no-restore
+
+      - name: Run unit and integration tests
+        run: dotnet test Festival.Platform.slnx --configuration Release --no-build
