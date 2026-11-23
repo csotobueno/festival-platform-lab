@@ -1,4 +1,5 @@
 using Festival.Modules.Notifications.Application;
+using Festival.Modules.Notifications.Contracts;
 using Festival.Modules.Notifications.Domain;
 using Festival.Modules.Notifications.Infrastructure;
 using Microsoft.EntityFrameworkCore;
@@ -159,18 +160,22 @@ public sealed class NotificationPersistenceTests(PostgreSqlFixture postgres)
         var useCase = scope.ServiceProvider.GetRequiredService<RequestNotificationUseCase>();
         Assert.Same(useCase, scope.ServiceProvider.GetRequiredService<RequestNotificationUseCase>());
         Assert.NotSame(useCase, otherScope.ServiceProvider.GetRequiredService<RequestNotificationUseCase>());
+        var service = scope.ServiceProvider.GetRequiredService<INotificationRequestService>();
+        Assert.IsType<NotificationRequestService>(service);
+        Assert.Same(service, scope.ServiceProvider.GetRequiredService<INotificationRequestService>());
+        Assert.NotSame(service, otherScope.ServiceProvider.GetRequiredService<INotificationRequestService>());
         Assert.IsType<SimulatedNotificationDelivery>(scope.ServiceProvider.GetRequiredService<INotificationDelivery>());
         Assert.IsType<EfNotificationRepository>(scope.ServiceProvider.GetRequiredService<INotificationRepository>());
         var context = scope.ServiceProvider.GetRequiredService<NotificationDbContext>();
         Assert.Same(context, scope.ServiceProvider.GetRequiredService<NotificationDbContext>());
         Assert.NotSame(context, otherScope.ServiceProvider.GetRequiredService<NotificationDbContext>());
 
-        var result = await useCase.ExecuteAsync(Guid.NewGuid(), "jane@example.com");
+        var result = await service.RequestAsync(new NotificationRequest(Guid.NewGuid(), "jane@example.com"), default);
 
-        var success = Assert.IsType<NotificationResult.Success>(result);
+        Assert.Equal(NotificationRequestResult.Success, result);
         await using var verification = CreateContext();
         Assert.Equal(NotificationStatus.Sent,
-            (await verification.Notifications.SingleAsync(x => x.NotificationId == success.NotificationId)).Status);
+            (await verification.Notifications.SingleAsync()).Status);
         Assert.Empty(verification.Model.FindEntityType(typeof(Notification))!.GetForeignKeys());
         await using var connection = new NpgsqlConnection(connectionString);
         await connection.OpenAsync();

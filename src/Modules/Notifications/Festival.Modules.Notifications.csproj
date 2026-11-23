@@ -14,7 +14,9 @@
     <PackageReference Include="Npgsql.EntityFrameworkCore.PostgreSQL" Version="10.0.3" />
   </ItemGroup>
   <ItemGroup>
+    <ProjectReference Include="../Notifications.Contracts/Festival.Modules.Notifications.Contracts.csproj" />
     <InternalsVisibleTo Include="Festival.Modules.Notifications.Tests" />
     <InternalsVisibleTo Include="Festival.Modules.Notifications.IntegrationTests" />
+    <InternalsVisibleTo Include="Festival.Modules.Registration.IntegrationTests" />
   </ItemGroup>
 </Project>

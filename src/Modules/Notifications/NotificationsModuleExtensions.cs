@@ -1,4 +1,5 @@
 using Festival.Modules.Notifications.Application;
+using Festival.Modules.Notifications.Contracts;
 using Festival.Modules.Notifications.Infrastructure;
 using Microsoft.Extensions.DependencyInjection;
 
@@ -16,6 +17,7 @@ public static class NotificationsModuleExtensions
         services.AddScoped<INotificationRepository, EfNotificationRepository>();
         services.AddScoped<INotificationDelivery, SimulatedNotificationDelivery>();
         services.AddScoped<RequestNotificationUseCase>();
+        services.AddScoped<INotificationRequestService, NotificationRequestService>();
         return services;
     }
 }

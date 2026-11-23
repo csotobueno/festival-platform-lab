@@ -33,8 +33,9 @@ Issue #4 implements the Registration portion of the first vertical slice:
 validate attendee details, create a confirmed registration, persist it in
 PostgreSQL, and reject duplicate emails. Issue #5 adds an independently testable
 Notifications request and delivery lifecycle with PostgreSQL persistence and
-simulated delivery. The domain and architecture documents describe the broader
-planned flow; Registration → Notifications integration remains deferred.
+simulated delivery. Issue #6 completes Registration → Notifications through a
+provider-owned synchronous in-process contract. Notification failures preserve
+the committed Registration and its HTTP `201` response.
 
 ## Solution structure
 
@@ -52,6 +53,8 @@ src/
     │   ├── Infrastructure/          # DbContext, repository, migrations
     │   ├── Presentation/            # POST /registrations
     │   └── RegistrationModuleExtensions.cs
+    ├── Notifications.Contracts/   # Public request, result, and service interface
+    │   └── Festival.Modules.Notifications.Contracts.csproj
     └── Notifications/
         ├── Festival.Modules.Notifications.csproj
         ├── Domain/
@@ -65,7 +68,9 @@ src/
 configure dependency injection. The host also calls `MapRegistrationEndpoints()`
 and configures generic problem responses for unhandled exceptions.
 
-Neither module references the other. Registration uses the ASP.NET Core framework
+Neither implementation references the other. Both reference only
+`Festival.Modules.Notifications.Contracts` for integration; that library has no
+package, framework, or module dependencies. Registration uses the ASP.NET Core framework
 for its module-owned endpoints and EF Core with the Npgsql PostgreSQL provider for
 persistence. Notifications uses the same EF Core/Npgsql package versions for its
 own persistence, without an ASP.NET Core dependency or public HTTP endpoint.
@@ -85,8 +90,10 @@ own persistence, without an ASP.NET Core dependency or public HTTP endpoint.
   Lowercasing the entire address is a deliberate Stage 1 business rule.
 - `RegisterAttendeeUseCase` depends on the Application-owned
   `IRegistrationRepository`, with explicit success, invalid-input, and
-  duplicate-email results. Domain and Application reference no HTTP, EF Core,
-  or PostgreSQL types. Asynchronous operations propagate cancellation tokens.
+  duplicate-email results. After a successful repository commit, it calls
+  `INotificationRequestService` with the Registration identifier and normalized
+  email. Domain and Application reference no HTTP, EF Core, or PostgreSQL types.
+  Asynchronous operations propagate cancellation tokens.
 - The internal `RegistrationDbContext` and `EfRegistrationRepository` implement
   persistence. Only the integration test assembly can access these internals.
   The use case, repository, and DbContext have scoped lifetimes.
@@ -104,7 +111,7 @@ own persistence, without an ASP.NET Core dependency or public HTTP endpoint.
 One module project keeps logical layers simple, with no generic repository or
 Unit of Work. Layering inside that project is maintained by code organization;
 it is not enforced by separate assemblies. There is no independent Attendee
-entity, notifications integration, or automatic migration on API startup.
+entity or automatic migration on API startup.
 
 ## Notifications design
 
@@ -119,8 +126,12 @@ entity, notifications integration, or automatic migration on API startup.
 - `RequestNotificationUseCase` depends on Application-owned
   `INotificationRepository` and `INotificationDelivery`. The aggregate, use case,
   application contracts, and persistence services are internal, accessible only
-  to this module and its two friend test assemblies. There is no inter-module
-  contract yet.
+  to this module and friend test assemblies, including the Registration HTTP
+  integration tests for workflow verification. The internal scoped
+  `NotificationRequestService` adapter implements the public contract and delegates
+  validation and lifecycle rules to this use case. It maps results to
+  `NotificationRequestResult.Success`, `DeliveryFailed`, or `InvalidInput`, without
+  exposing aggregates or persistence details. Exceptions propagate to the caller.
 - The repository's `AddAsync` commits `Pending` and retains the tracked aggregate.
   Delivery then runs with no database transaction open. A separate
   `SaveChangesAsync` commits the terminal status before the use case returns
@@ -145,6 +156,37 @@ after delivery may leave `Pending` even though delivery occurred. There is no
 automatic recovery, retry, idempotency guarantee, or cross-module transaction in
 this issue. `Sent` represents simulated delivery success only. Separate schemas
 allow both modules to share a physical database without sharing tables or migrations.
+
+## Registration → Notifications integration
+
+The host composes both modules through their existing registration extensions.
+`AddNotificationsModule` binds `INotificationRequestService` to its internal adapter
+with a scoped lifetime, matching both modules' use cases and EF Core contexts.
+Registration invokes it only after `IRegistrationRepository.AddAsync` commits;
+invalid input, precheck duplicates, concurrent insert conflicts, and Registration
+storage errors never request a notification. Each module accesses its own tables.
+
+Successful simulated delivery stores `Sent`; expected delivery failure stores
+`Failed`. Neither changes Registration's `Confirmed` status or the API response.
+The contract also reports `InvalidInput` for invalid notification data. Registration
+logs any unsuccessful contract outcome and catches unexpected exceptions only
+around the notification call, including cancellation after the Registration commit.
+Cancellation before/during Registration validation or storage continues to propagate.
+The HTTP connection may already be closed if the client cancels after commit.
+
+Integration failures use error event `6001` (`RegistrationConfirmationNotificationFailed`)
+with structured `RegistrationId`, `Operation` (`RequestRegistrationConfirmation`),
+and `FailureCategory` (`DeliveryFailed`, `InvalidInput`, or `UnexpectedError`).
+Unexpected exceptions are attached to the log; recipient emails and names are not
+added to log messages or structured fields. Logging-provider failures are isolated
+so they cannot turn a committed Registration into an unsuccessful business result.
+
+No transaction spans the two modules. If the initial Notifications save fails or
+the process stops between commits, a confirmed Registration may have no notification
+record. A final-save failure or unexpected delivery error can leave a committed
+`Pending` row, even if simulated delivery already occurred. There are no automatic
+retries, recovery, or delivery guarantees. Synchronous delivery also adds to HTTP
+request latency. `POST /registrations` still returns only `registrationId` on `201`.
 
 ## Build
 
@@ -267,10 +309,19 @@ and inject real PostgreSQL constraint failures on insert/update. Failed final
 saves propagate and preserve the committed `Pending` row. Each Notifications
 test uses its own database and the same Testcontainers setup as Registration.
 
+Contract adapter tests verify result mapping and propagation of infrastructure
+failures. Registration tests verify notification data and invocation ordering,
+failures and cancellation after commit, structured logs, and no notification for
+invalid/duplicate/failed Registration attempts. HTTP integration tests migrate both
+schemas and verify `Confirmed` with `Sent` or `Failed` in separate module-owned
+contexts. Real Notifications insert/update constraint failures preserve HTTP `201`
+and generate error logs; initial-save failure leaves no row, final-save failure
+leaves `Pending`. Registration database errors still return HTTP `500`.
+
 The concurrency test synchronizes two real repository lookups so both observe
 an absent email before either inserts. Separate HTTP scopes/DbContexts then race
 against the unique index; exactly one request succeeds and the other conflicts,
-with one persisted row. It uses no timing sleeps or EF InMemory provider.
+with one persisted Registration and one Notification. It uses no timing sleeps or EF InMemory provider.
 
 For older Docker installations that require an explicit API version, prefix the
 test command with the daemon's supported version, for example
@@ -289,7 +340,8 @@ Inspect project references:
 dotnet list src/Festival.Api/Festival.Api.csproj reference
 dotnet list src/Modules/Registration/Festival.Modules.Registration.csproj reference
 dotnet list src/Modules/Notifications/Festival.Modules.Notifications.csproj reference
+dotnet list src/Modules/Notifications.Contracts/Festival.Modules.Notifications.Contracts.csproj reference
 ```
 
-The API must list both module projects. Each module must report no project
-references.
+The API must list both implementation projects. Each module must reference only
+Notifications.Contracts; the contracts library must report no project references.

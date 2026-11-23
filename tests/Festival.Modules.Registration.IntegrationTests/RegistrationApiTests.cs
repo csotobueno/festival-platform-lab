@@ -1,6 +1,9 @@
 using System.Net;
 using System.Net.Http.Json;
 using System.Text;
+using Festival.Modules.Notifications.Application;
+using Festival.Modules.Notifications.Domain;
+using Festival.Modules.Notifications.Infrastructure;
 using Festival.Modules.Registration.Application;
 using Festival.Modules.Registration.Domain;
 using Festival.Modules.Registration.Infrastructure;
@@ -11,6 +14,7 @@ using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.AspNetCore.TestHost;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 using Npgsql;
 using RegistrationAggregate = Festival.Modules.Registration.Domain.Registration;
 
@@ -30,6 +34,8 @@ public sealed class RegistrationApiTests(PostgreSqlFixture postgres) : IClassFix
 
         await using var context = CreateContext();
         await context.Database.MigrateAsync();
+        await using var notifications = CreateNotificationContext();
+        await notifications.Database.MigrateAsync();
     }
 
     public async Task DisposeAsync()
@@ -62,6 +68,13 @@ public sealed class RegistrationApiTests(PostgreSqlFixture postgres) : IClassFix
         Assert.Equal(TimeSpan.Zero, stored.RegisteredAt.Offset);
         Assert.InRange(stored.RegisteredAt, before.AddSeconds(-1), DateTimeOffset.UtcNow);
         Assert.False(context.Database.HasPendingModelChanges());
+        await using var notifications = CreateNotificationContext();
+        var notification = await notifications.Notifications.AsNoTracking().SingleAsync();
+        Assert.Equal(body.RegistrationId, notification.RegistrationId);
+        Assert.Equal("jane@example.com", notification.RecipientEmail);
+        Assert.Equal(NotificationStatus.Sent, notification.Status);
+        using var json = System.Text.Json.JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+        Assert.Equal("registrationId", Assert.Single(json.RootElement.EnumerateObject()).Name);
     }
 
     [Theory]
@@ -82,6 +95,8 @@ public sealed class RegistrationApiTests(PostgreSqlFixture postgres) : IClassFix
         Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
         await using var context = CreateContext();
         Assert.Equal(0, await context.Registrations.CountAsync());
+        await using var notifications = CreateNotificationContext();
+        Assert.Empty(await notifications.Notifications.ToListAsync());
     }
 
     [Theory]
@@ -100,6 +115,8 @@ public sealed class RegistrationApiTests(PostgreSqlFixture postgres) : IClassFix
         Assert.Equal(409, problem!.Status);
         await using var context = CreateContext();
         Assert.Equal(1, await context.Registrations.CountAsync());
+        await using var notifications = CreateNotificationContext();
+        Assert.Single(await notifications.Notifications.ToListAsync());
     }
 
     [Fact]
@@ -122,6 +139,9 @@ public sealed class RegistrationApiTests(PostgreSqlFixture postgres) : IClassFix
             await using var context = CreateContext();
             var stored = await context.Registrations.SingleAsync();
             Assert.Equal("jane@example.com", stored.AttendeeDetails.Email);
+            await using var notifications = CreateNotificationContext();
+            var notification = await notifications.Notifications.SingleAsync();
+            Assert.Equal(stored.RegistrationId, notification.RegistrationId);
         }
         finally
         {
@@ -190,6 +210,110 @@ public sealed class RegistrationApiTests(PostgreSqlFixture postgres) : IClassFix
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
     }
 
+    [Fact]
+    public async Task Expected_delivery_failure_preserves_confirmed_registration_and_records_failed_notification()
+    {
+        var delivery = new ControlledDelivery(async cancellationToken =>
+        {
+            // Fresh contexts observe both commits before delivery, with no shared transaction.
+            await using var registrations = CreateContext();
+            var registration = await registrations.Registrations.SingleAsync(cancellationToken);
+            Assert.Equal(RegistrationStatus.Confirmed, registration.Status);
+            await using var notifications = CreateNotificationContext();
+            var notification = await notifications.Notifications.SingleAsync(cancellationToken);
+            Assert.Equal(registration.RegistrationId, notification.RegistrationId);
+            Assert.Equal(NotificationStatus.Pending, notification.Status);
+            return NotificationDeliveryResult.Failed;
+        });
+        var logger = new IntegrationLogger();
+        using var client = CreateClient(services =>
+        {
+            services.AddScoped<INotificationDelivery>(_ => delivery);
+            services.AddSingleton<ILogger<RegisterAttendeeUseCase>>(logger);
+        });
+
+        using var response = await client.PostAsJsonAsync("/registrations", new { name = "Jane", email = "jane@example.com" });
+
+        Assert.Equal(HttpStatusCode.Created, response.StatusCode);
+        var body = await response.Content.ReadFromJsonAsync<RegistrationResponse>();
+        await using var registrations = CreateContext();
+        Assert.Equal(RegistrationStatus.Confirmed, (await registrations.Registrations.SingleAsync()).Status);
+        await using var notifications = CreateNotificationContext();
+        var notification = await notifications.Notifications.SingleAsync();
+        Assert.Equal(body!.RegistrationId, notification.RegistrationId);
+        Assert.Equal(NotificationStatus.Failed, notification.Status);
+        Assert.Equal(1, delivery.Calls);
+        Assert.Equal("DeliveryFailed", Assert.Single(logger.Entries).Category);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Notification_database_failure_is_logged_and_preserves_committed_registration(bool finalSave)
+    {
+        await using (var setup = CreateNotificationContext())
+        {
+            await setup.Database.ExecuteSqlRawAsync(finalSave
+                ? "ALTER TABLE notifications.notifications ADD CONSTRAINT reject_completion CHECK (status = 'Pending')"
+                : "ALTER TABLE notifications.notifications ADD CONSTRAINT reject_insert CHECK (false)");
+        }
+        var logger = new IntegrationLogger();
+        var delivery = new ControlledDelivery(_ => Task.FromResult(NotificationDeliveryResult.Sent));
+        using var client = CreateClient(services =>
+        {
+            services.AddSingleton<ILogger<RegisterAttendeeUseCase>>(logger);
+            services.AddScoped<INotificationDelivery>(_ => delivery);
+        });
+
+        using var response = await client.PostAsJsonAsync("/registrations", new { name = "Jane", email = "jane@example.com" });
+
+        Assert.Equal(HttpStatusCode.Created, response.StatusCode);
+        var body = await response.Content.ReadFromJsonAsync<RegistrationResponse>();
+        await using var registrations = CreateContext();
+        var registration = await registrations.Registrations.SingleAsync();
+        Assert.Equal(body!.RegistrationId, registration.RegistrationId);
+        Assert.Equal(RegistrationStatus.Confirmed, registration.Status);
+        await using var notifications = CreateNotificationContext();
+        var rows = await notifications.Notifications.ToListAsync();
+        if (finalSave)
+        {
+            var pending = Assert.Single(rows);
+            Assert.Equal(NotificationStatus.Pending, pending.Status);
+            Assert.Equal(registration.RegistrationId, pending.RegistrationId);
+        }
+        else Assert.Empty(rows);
+        Assert.Equal(finalSave ? 1 : 0, delivery.Calls);
+        var log = Assert.Single(logger.Entries);
+        Assert.Equal(LogLevel.Error, log.Level);
+        Assert.Equal(6001, log.Event.Id);
+        Assert.Equal(registration.RegistrationId, log.RegistrationId);
+        Assert.Equal("RequestRegistrationConfirmation", log.Operation);
+        Assert.Equal("UnexpectedError", log.Category);
+        var exception = Assert.IsType<DbUpdateException>(log.Exception);
+        Assert.Equal(PostgresErrorCodes.CheckViolation, Assert.IsType<PostgresException>(exception.InnerException).SqlState);
+        Assert.DoesNotContain("jane@example.com", log.Message);
+        Assert.DoesNotContain("Exception", await response.Content.ReadAsStringAsync());
+    }
+
+    [Fact]
+    public async Task Registration_database_failure_returns_500_without_notification()
+    {
+        await using (var setup = CreateContext())
+        {
+            await setup.Database.ExecuteSqlRawAsync(
+                "ALTER TABLE registration.registrations ADD CONSTRAINT reject_insert CHECK (false)");
+        }
+        var logger = new IntegrationLogger();
+        using var client = CreateClient(services => services.AddSingleton<ILogger<RegisterAttendeeUseCase>>(logger));
+
+        using var response = await client.PostAsJsonAsync("/registrations", new { name = "Jane", email = "jane@example.com" });
+
+        Assert.Equal(HttpStatusCode.InternalServerError, response.StatusCode);
+        await using var notifications = CreateNotificationContext();
+        Assert.Empty(await notifications.Notifications.ToListAsync());
+        Assert.Empty(logger.Entries);
+    }
+
     private HttpClient CreateClient(Action<IServiceCollection>? configure = null)
     {
         factory = new WebApplicationFactory<Program>().WithWebHostBuilder(builder =>
@@ -207,6 +331,40 @@ public sealed class RegistrationApiTests(PostgreSqlFixture postgres) : IClassFix
         var options = new DbContextOptionsBuilder<RegistrationDbContext>();
         RegistrationDbContext.Configure(options, connectionString);
         return new RegistrationDbContext(options.Options);
+    }
+
+    private NotificationDbContext CreateNotificationContext()
+    {
+        var options = new DbContextOptionsBuilder<NotificationDbContext>();
+        NotificationDbContext.Configure(options, connectionString);
+        return new NotificationDbContext(options.Options);
+    }
+
+    private sealed class ControlledDelivery(Func<CancellationToken, Task<NotificationDeliveryResult>> deliver) : INotificationDelivery
+    {
+        public int Calls { get; private set; }
+        public Task<NotificationDeliveryResult> DeliverAsync(string recipientEmail, CancellationToken cancellationToken)
+        {
+            Calls++;
+            return deliver(cancellationToken);
+        }
+    }
+
+    private sealed record IntegrationLog(LogLevel Level, EventId Event, Guid RegistrationId,
+        string Operation, string Category, Exception? Exception, string Message);
+
+    private sealed class IntegrationLogger : ILogger<RegisterAttendeeUseCase>
+    {
+        public List<IntegrationLog> Entries { get; } = [];
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+        public bool IsEnabled(LogLevel logLevel) => true;
+        public void Log<TState>(LogLevel logLevel, EventId eventId, TState state,
+            Exception? exception, Func<TState, Exception?, string> formatter)
+        {
+            var fields = ((IEnumerable<KeyValuePair<string, object?>>)(object)state!).ToDictionary();
+            Entries.Add(new IntegrationLog(logLevel, eventId, (Guid)fields["RegistrationId"]!,
+                (string)fields["Operation"]!, (string)fields["FailureCategory"]!, exception, formatter(state, exception)));
+        }
     }
 
     private sealed class ConcurrentLookupGate
